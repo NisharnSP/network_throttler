@@ -2,20 +2,15 @@
 
 A **GUI application** for simulating various **network conditions** on **Linux** systems. Used for testing applications under poor network conditions, simulating high latency connections, or reproducing network-related bugs.
 
-## Features
+## Configurable Network Parameters
 
-* **Real-time network throttling** - Changes apply instantly as you adjust sliders.
-* **Target specific IP addresses** - Throttle traffic to individual destinations.
-* **Comprehensive network parameters:**
-    * Latency/Delay (0-2000ms)
-    * Jitter (0-500ms)
-    * Packet Loss (0-100%)
-    * Bandwidth Limiting (1-1000 Mbit/s)
-    * Packet Duplication (0-100%)
-    * Packet Corruption (0-100%)
-    * Packet Reordering (0-100%)
-* Clean interface with visual feedback.
-* Automatic cleanup on exit.
+* Latency/Delay (0-2000ms)
+* Jitter (0-500ms)
+* Packet Loss (0-100%)
+* Bandwidth Limiting (1-1000 Mbit/s)
+* Packet Duplication (0-100%)
+* Packet Corruption (0-100%)
+* Packet Reordering (0-100%)
 
 ## Requirements
 
@@ -24,7 +19,7 @@ A **GUI application** for simulating various **network conditions** on **Linux**
 * **Root/sudo privileges**
 * **tkinter**
 
-## Installation & Usage
+## Installation
 
 ```bash
 git clone git@github.com:NisharnSP/network_throttler.git && cd network-throttler
@@ -35,7 +30,7 @@ sudo python3 network_throttle.py
 sudo ./network_throttle.py
 ```
 ---
-### Behaviour
+### Usage
 1. Enter the target IP address you want to throttle.
 2. Click "Apply IP" to configure the target.
 3. Adjust sliders to set network conditions.
