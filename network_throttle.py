@@ -7,6 +7,11 @@ import os
 import sys
 import atexit
 import signal
+import math
+
+# Bandwidth slider range (in Mbit/s)
+BANDWIDTH_MIN = 0.05
+BANDWIDTH_MAX = 500
 
 
 class PasswordDialog(simpledialog.Dialog):
@@ -120,6 +125,20 @@ class NetworkThrottleGUI:
 
         self.create_widgets()
 
+    def slider_to_bandwidth(self, slider_val):
+        """Convert linear slider value (0-100) to logarithmic bandwidth."""
+        log_min = math.log(BANDWIDTH_MIN)
+        log_max = math.log(BANDWIDTH_MAX)
+        log_bw = log_min + (log_max - log_min) * (slider_val / 100)
+        return math.exp(log_bw)
+
+    def bandwidth_to_slider(self, bandwidth):
+        """Convert bandwidth to linear slider value (0-100)."""
+        log_min = math.log(BANDWIDTH_MIN)
+        log_max = math.log(BANDWIDTH_MAX)
+        log_bw = math.log(max(BANDWIDTH_MIN, min(BANDWIDTH_MAX, bandwidth)))
+        return 100 * (log_bw - log_min) / (log_max - log_min)
+
     def create_widgets(self):
         # Title
         title_label = ttk.Label(self.root, text="Network Traffic Control", font=("", 16, "bold"))
@@ -158,7 +177,7 @@ class NetworkThrottleGUI:
         params_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         # Delay/Latency
-        self.create_slider(params_frame, 0, "Latency (ms):", 0, 2000, 0, "delay_var", "delay_label", " ms")
+        self.create_slider(params_frame, 0, "Latency (ms):", 0, 5000, 0, "delay_var", "delay_label", " ms")
 
         # Jitter
         self.create_slider(params_frame, 1, "Jitter (ms):", 0, 500, 0, "jitter_var", "jitter_label", " ms")
@@ -168,9 +187,9 @@ class NetworkThrottleGUI:
             params_frame, 2, "Packet Loss (%):", 0, 100, 0, "loss_var", "loss_label", " %", resolution=0.1
         )
 
-        # Bandwidth
+        # Bandwidth (logarithmic slider, 0-100 maps to 0.05-500 Mbit/s)
         self.create_slider(
-            params_frame, 3, "Bandwidth Limit (Mbit/s):", 1, 1000, 1000, "bandwidth_var", "bandwidth_label", " Mbit/s"
+            params_frame, 3, "Bandwidth Limit (Mbit/s):", 0, 100, 100, "bandwidth_var", "bandwidth_label", " Mbit/s"
         )
 
         # Duplicate packets
@@ -322,11 +341,12 @@ class NetworkThrottleGUI:
 
     def has_non_default_settings(self):
         """Check if any settings are different from defaults."""
+        bandwidth = self.slider_to_bandwidth(self.bandwidth_var.get())
         return (
             int(self.delay_var.get()) != 0
             or int(self.jitter_var.get()) != 0
             or self.loss_var.get() != 0
-            or int(self.bandwidth_var.get()) != 1000
+            or abs(bandwidth - BANDWIDTH_MAX) > 0.01
             or self.duplicate_var.get() != 0
             or self.corrupt_var.get() != 0
             or self.reorder_var.get() != 0
@@ -338,7 +358,14 @@ class NetworkThrottleGUI:
         self.delay_label.config(text=f"{int(self.delay_var.get())} ms")
         self.jitter_label.config(text=f"{int(self.jitter_var.get())} ms")
         self.loss_label.config(text=f"{self.loss_var.get():.1f} %")
-        self.bandwidth_label.config(text=f"{int(self.bandwidth_var.get())} Mbit/s")
+
+        # Bandwidth label with logarithmic conversion
+        bandwidth = self.slider_to_bandwidth(self.bandwidth_var.get())
+        if bandwidth >= 1:
+            self.bandwidth_label.config(text=f"{bandwidth:.1f} Mbit/s")
+        else:
+            self.bandwidth_label.config(text=f"{bandwidth:.2f} Mbit/s")
+
         self.duplicate_label.config(text=f"{self.duplicate_var.get():.1f} %")
         self.corrupt_label.config(text=f"{self.corrupt_var.get():.1f} %")
         self.reorder_label.config(text=f"{self.reorder_var.get():.1f} %")
@@ -383,7 +410,7 @@ class NetworkThrottleGUI:
         delay = int(self.delay_var.get())
         jitter = int(self.jitter_var.get())
         loss = self.loss_var.get()
-        bandwidth = int(self.bandwidth_var.get())
+        bandwidth = self.slider_to_bandwidth(self.bandwidth_var.get())
         duplicate = self.duplicate_var.get()
         corrupt = self.corrupt_var.get()
         reorder = self.reorder_var.get()
@@ -481,7 +508,7 @@ class NetworkThrottleGUI:
         self.delay_var.set(0)
         self.jitter_var.set(0)
         self.loss_var.set(0)
-        self.bandwidth_var.set(1000)
+        self.bandwidth_var.set(BANDWIDTH_MAX)
         self.duplicate_var.set(0)
         self.corrupt_var.set(0)
         self.reorder_var.set(0)
