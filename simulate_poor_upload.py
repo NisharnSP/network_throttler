@@ -12,12 +12,18 @@ Defaults are tuned for *realistic* network behaviour:
     doesn't exist on real networks and wrecks WebRTC's GCC)
   - bursty loss option uses Gilbert-Elliott (real loss isn't independent)
   - HTB burst is sized for the link (not artificially generous at low rates)
-  - netem queue limit is raised so high-RTT scenarios don't drop silently
+  - netem queue is sized from the bandwidth-delay product, so congestion
+    produces realistic tail-drop instead of seconds of bufferbloat
 
-Note: this throttles ALL egress on the chosen interface.
+By default this shapes ALL egress on the chosen interface; set a Target IP to
+shape only traffic to that host (e.g. a robot) so your own session stays intact.
+Shaping sits below the transport, so TCP backs off and retransmits while UDP/RTP
+just see the raw loss/delay/jitter/reorder. It is one-way: run it on the sender
+to preview what the receiver gets.
 """
 
 import atexit
+import ipaddress
 import math
 import os
 import signal
@@ -28,10 +34,6 @@ from tkinter import messagebox, simpledialog, ttk
 
 BANDWIDTH_MIN = 0.05   # 50 kbit/s
 BANDWIDTH_MAX = 1000   # 1 Gbit/s
-
-# netem queue depth. Default is 1000 packets; at high rate * high delay this
-# silently fills and drops packets, which the receiver sees as loss.
-NETEM_LIMIT = 10000
 
 DISTRIBUTIONS = ("normal", "paretonormal", "pareto", "uniform")
 
@@ -103,6 +105,8 @@ def request_sudo_privileges():
         if process.poll() is None:
             temp_root.destroy()
             sys.exit(0)
+        temp_root.destroy()
+        return False
     except Exception as e:
         messagebox.showerror("Error", f"Failed to request privileges:\n{e}", parent=temp_root)
         temp_root.destroy()
@@ -113,7 +117,7 @@ class UploadSimulator:
     def __init__(self, root):
         self.root = root
         self.root.title("Poor Upload Simulator")
-        self.root.geometry("720x780")
+        self.root.geometry("720x860")
 
         if os.geteuid() != 0:
             messagebox.showerror(
@@ -125,24 +129,27 @@ class UploadSimulator:
         self.interface = None
         self.iface_mtu = 1500
         self.tc_applied = False
+        self.applied_target = None
         self.apply_timer = None
         self.suppress_callbacks = False
 
         atexit.register(self.cleanup)
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        self.root.report_callback_exception = self._on_callback_exception
 
         self._build_ui()
         self._auto_detect_interface()
+        self._pump()
 
     # ---------- UI ----------
 
     def _build_ui(self):
         ttk.Label(self.root, text="Poor Upload Simulator", font=("", 16, "bold")).pack(pady=8)
 
-        info = ("Shapes EGRESS traffic on the chosen interface. Defaults are tuned for\n"
-                "realistic behaviour — uncorrelated uniform jitter wrecks WebRTC even at\n"
-                "low values because GCC reads the variance as congestion.")
+        info = ("Shapes EGRESS on the chosen interface (set a Target IP to spare your own\n"
+                "session). One-way: run it on the sender to preview what the receiver gets.\n"
+                "Defaults are realistic — uncorrelated uniform jitter wrecks WebRTC's GCC.")
         ttk.Label(self.root, text=info, font=("", 9), foreground="gray",
                   justify="center", wraplength=680).pack(pady=2)
 
@@ -158,6 +165,17 @@ class UploadSimulator:
         ttk.Button(row, text="Refresh", command=self._refresh_interfaces).pack(side="left", padx=5)
         self.iface_status = ttk.Label(iface_frame, text="Detecting…", foreground="orange", font=("", 9))
         self.iface_status.pack(pady=4)
+
+        target_row = ttk.Frame(iface_frame)
+        target_row.pack(fill="x", pady=(2, 0))
+        ttk.Label(target_row, text="Target IP:").pack(side="left", padx=5)
+        self.target_var = tk.StringVar()
+        target_entry = ttk.Entry(target_row, textvariable=self.target_var, width=24)
+        target_entry.pack(side="left", padx=5)
+        target_entry.bind("<Return>", self._on_target_change)
+        target_entry.bind("<FocusOut>", self._on_target_change)
+        ttk.Label(target_row, text="(blank = whole interface)", font=("", 8),
+                  foreground="gray").pack(side="left", padx=5)
 
         preset_frame = ttk.Frame(self.root, padding=(10, 0))
         preset_frame.pack(fill="x", padx=10, pady=4)
@@ -204,7 +222,10 @@ class UploadSimulator:
         ttk.Label(params, text="(realistic for cellular/WiFi)", font=("", 8), foreground="gray").grid(
             row=6, column=2, sticky="w", padx=5)
 
-        self._make_slider(params, 7, "Reorder:", 0, 50, 0, "reorder_var", "reorder_label",
+        self._make_slider(params, 7, "Corrupt:", 0, 50, 0, "corrupt_var", "corrupt_label",
+                          resolution=0.1, formatter=lambda v: f"{v:.1f} %")
+
+        self._make_slider(params, 8, "Reorder:", 0, 50, 0, "reorder_var", "reorder_label",
                           resolution=0.1, formatter=lambda v: f"{v:.1f} %")
 
         params.columnconfigure(1, weight=1)
@@ -265,6 +286,7 @@ class UploadSimulator:
         self.jitter_label.config(text=self.jitter_label_fmt(self.jitter_var.get()))
         self.correlation_label.config(text=self.correlation_label_fmt(self.correlation_var.get()))
         self.loss_label.config(text=self.loss_label_fmt(self.loss_var.get()))
+        self.corrupt_label.config(text=self.corrupt_label_fmt(self.corrupt_var.get()))
         self.reorder_label.config(text=self.reorder_label_fmt(self.reorder_var.get()))
 
         if self.suppress_callbacks:
@@ -289,6 +311,7 @@ class UploadSimulator:
             self.correlation_var.set(cfg["correlation"])
             self.loss_var.set(cfg["loss"])
             self.bursty_var.set(cfg["bursty"])
+            self.corrupt_var.set(cfg.get("corrupt", 0))
             self.reorder_var.set(cfg["reorder"])
             self._on_slider_change()
         finally:
@@ -299,6 +322,10 @@ class UploadSimulator:
     def _reset(self):
         self.preset_var.set("Off (full speed)")
         self._apply_preset()
+
+    def _on_target_change(self, _event=None):
+        if self.interface:
+            self._apply_settings()
 
     # ---------- Interface discovery ----------
 
@@ -376,6 +403,9 @@ class UploadSimulator:
             self.cleanup()
         self.interface = new_iface
         self.iface_mtu = self._get_iface_mtu(new_iface)
+        if not self.tc_applied:
+            # Clear any qdisc left behind by a previous run that crashed.
+            self._run(f"tc qdisc del dev {new_iface} root 2>/dev/null", show_errors=False)
         self.iface_status.config(
             text=f"Selected: {new_iface}   |   MTU {self.iface_mtu}", foreground="green"
         )
@@ -391,19 +421,20 @@ class UploadSimulator:
             int(self.delay_var.get()) > 0
             or int(self.jitter_var.get()) > 0
             or self.loss_var.get() > 0
+            or self.corrupt_var.get() > 0
             or self.reorder_var.get() > 0
             or abs(self._slider_to_bandwidth(self.bw_var.get()) - BANDWIDTH_MAX) > 0.01
         )
 
     def _build_burst(self, rate_mbit):
-        # HTB needs burst >= max(MTU, rate/HZ). HZ is 250 on most kernels.
-        # Generous burst at low rates lets large bursts leak through and
-        # defeats the rate limit, so keep this tight.
+        # HTB needs burst >= one scheduler tick of data (and >= MTU). Size it to
+        # ~4ms of traffic so the rate holds at high rates while clamping to the
+        # MTU at low rates, where a generous burst would leak past the limit.
         rate_bytes_per_sec = rate_mbit * 1_000_000 / 8
         return max(self.iface_mtu, int(rate_bytes_per_sec / 250))
 
-    def _build_netem_args(self, delay, jitter, distribution, correlation,
-                          loss, bursty, reorder):
+    def _build_netem_args(self, rate_mbit, delay, jitter, distribution, correlation,
+                          loss, bursty, corrupt, reorder):
         """Build netem argument list for the given conditions.
 
         Reorder needs a non-zero delay base to take effect.
@@ -411,13 +442,13 @@ class UploadSimulator:
         netem clamps the negative-delay tail to zero, skewing the
         distribution). Auto-promote the base delay when needed.
         """
-        args = [f"limit {NETEM_LIMIT}"]
-
         effective_delay = delay
         if effective_delay < jitter:
             effective_delay = jitter        # keep delay range non-negative
         if effective_delay == 0 and reorder > 0:
             effective_delay = 10            # reorder requires a delay clause
+
+        args = [f"limit {self._build_limit(rate_mbit, effective_delay + jitter)}"]
 
         if effective_delay > 0:
             if jitter > 0:
@@ -440,10 +471,20 @@ class UploadSimulator:
             else:
                 args.append(f"loss {loss:.2f}%")
 
+        if corrupt > 0:
+            args.append(f"corrupt {corrupt:.2f}%")
+
         if reorder > 0:
             args.append(f"reorder {reorder:.2f}% 50%")
 
         return args
+
+    def _build_limit(self, rate_mbit, window_ms):
+        # netem holds the in-flight delay window plus a standing queue; a fixed
+        # limit means seconds of bufferbloat at low rates and silently drops the
+        # delay buffer at high rates, so size it from the bandwidth-delay product.
+        pkts_per_sec = rate_mbit * 1_000_000 / 8 / self.iface_mtu
+        return max(64, math.ceil(pkts_per_sec * (window_ms / 1000 + 0.3)))
 
     def _run(self, cmd, show_errors=True):
         try:
@@ -459,6 +500,14 @@ class UploadSimulator:
         if not self.interface:
             return False
 
+        target = self.target_var.get().strip()
+        if target:
+            try:
+                ipaddress.ip_address(target)
+            except ValueError:
+                self._set_status(f"Invalid target IP: {target}", "red")
+                return False
+
         bw = self._slider_to_bandwidth(self.bw_var.get())
         delay = int(self.delay_var.get())
         jitter = int(self.jitter_var.get())
@@ -466,10 +515,11 @@ class UploadSimulator:
         correlation = self.correlation_var.get()
         loss = self.loss_var.get()
         bursty = self.bursty_var.get()
+        corrupt = self.corrupt_var.get()
         reorder = self.reorder_var.get()
         burst = self._build_burst(bw)
-        netem_args = self._build_netem_args(delay, jitter, distribution, correlation,
-                                            loss, bursty, reorder)
+        netem_args = self._build_netem_args(bw, delay, jitter, distribution, correlation,
+                                            loss, bursty, corrupt, reorder)
         iface = self.interface
 
         if not self._has_non_default_settings():
@@ -478,17 +528,18 @@ class UploadSimulator:
             return True
 
         netem_tail = " ".join(netem_args)
+        htb_class = (f"rate {bw:.4f}mbit ceil {bw:.4f}mbit "
+                     f"mtu {self.iface_mtu} burst {burst} cburst {burst}")
 
-        if not self.tc_applied:
+        # Rebuild the tree on first apply or when the target changes; otherwise
+        # mutate in place so live tuning never briefly unshapes the stream.
+        if not self.tc_applied or self.applied_target != target:
             self._run(f"tc qdisc del dev {iface} root 2>/dev/null", show_errors=False)
-            if not self._run(f"tc qdisc add dev {iface} root handle 1: htb default 10"):
+            if not self._run(f"tc qdisc add dev {iface} root handle 1: htb "
+                             f"default {'20' if target else '10'}"):
                 self._set_status(f"Failed to add HTB on {iface} (already in use?)", "red")
                 return False
-            if not self._run(
-                f"tc class add dev {iface} parent 1: classid 1:10 htb "
-                f"rate {bw:.4f}mbit ceil {bw:.4f}mbit "
-                f"mtu {self.iface_mtu} burst {burst} cburst {burst}"
-            ):
+            if not self._run(f"tc class add dev {iface} parent 1: classid 1:10 htb {htb_class}"):
                 self._run(f"tc qdisc del dev {iface} root 2>/dev/null", show_errors=False)
                 self._set_status("Failed to add HTB class", "red")
                 return False
@@ -496,24 +547,33 @@ class UploadSimulator:
                 self._run(f"tc qdisc del dev {iface} root 2>/dev/null", show_errors=False)
                 self._set_status("Failed to add netem", "red")
                 return False
+            if target:
+                # Unshaped class for everything except the target, so your own
+                # session, control plane and internet on this interface stay fast.
+                self._run(f"tc class add dev {iface} parent 1: classid 1:20 htb "
+                          f"rate 10gbit ceil 10gbit")
+                proto, match = ("ipv6", "ip6") if ":" in target else ("ip", "ip")
+                if not self._run(f"tc filter add dev {iface} protocol {proto} parent 1: "
+                                 f"prio 1 u32 match {match} dst {target} flowid 1:10"):
+                    self._run(f"tc qdisc del dev {iface} root 2>/dev/null", show_errors=False)
+                    self._set_status("Failed to add target filter", "red")
+                    return False
             self.tc_applied = True
+            self.applied_target = target
         else:
-            if not self._run(
-                f"tc class change dev {iface} classid 1:10 htb "
-                f"rate {bw:.4f}mbit ceil {bw:.4f}mbit "
-                f"mtu {self.iface_mtu} burst {burst} cburst {burst}"
-            ):
+            if not self._run(f"tc class change dev {iface} classid 1:10 htb {htb_class}"):
                 self._set_status("HTB class change failed", "red")
                 return False
             if not self._run(f"tc qdisc replace dev {iface} parent 1:10 handle 10: netem {netem_tail}"):
                 self._set_status("netem replace failed", "red")
                 return False
 
+        scope = f"dst {target}" if target else f"all egress on {iface}"
         loss_str = f"{loss:.1f}% {'bursty' if bursty else 'random'}" if loss > 0 else "0%"
         self._set_status(
-            f"Active on {iface}  |  {self._fmt_bandwidth(self.bw_var.get())}, "
+            f"Active ({scope})  |  {self._fmt_bandwidth(self.bw_var.get())}, "
             f"latency {delay}±{jitter}ms ({distribution}, corr {int(correlation)}%), "
-            f"loss {loss_str}, reorder {reorder:.1f}%",
+            f"loss {loss_str}, corrupt {corrupt:.1f}%, reorder {reorder:.1f}%",
             "green",
         )
         self.netem_label.config(text=f"netem args: {netem_tail}")
@@ -526,9 +586,21 @@ class UploadSimulator:
         if self.tc_applied and self.interface:
             self._run(f"tc qdisc del dev {self.interface} root 2>/dev/null", show_errors=False)
             self.tc_applied = False
-            self._set_status(f"Removed (was on {self.interface})", "blue")
-            if hasattr(self, "netem_label"):
+            self.applied_target = None
+            try:
+                self._set_status(f"Removed (was on {self.interface})", "blue")
                 self.netem_label.config(text="")
+            except tk.TclError:
+                pass  # window already torn down; the qdisc is what matters
+
+    def _pump(self):
+        # Tk's mainloop blocks signal delivery; returning to Python periodically
+        # lets SIGINT/SIGTERM reach _signal_handler so tc rules are torn down.
+        self.root.after(200, self._pump)
+
+    def _on_callback_exception(self, exc, value, tb):
+        self.cleanup()
+        sys.excepthook(exc, value, tb)
 
     def _signal_handler(self, signum, frame):
         self.cleanup()
