@@ -7,9 +7,12 @@ this to see how outbound traffic — like a WebRTC video stream — behaves
 when the upstream link is bad.
 
 Defaults are tuned for *realistic* network behaviour:
-  - jitter uses correlation + paretonormal/normal distribution
-    (uncorrelated uniform jitter creates pathological reordering that
-    doesn't exist on real networks and wrecks WebRTC's GCC)
+  - jitter is one-sided, in-order delay variation via netem's slot
+    scheduler (packets wait for the next transmit opportunity; they
+    only ever arrive later, never early, and never overtake). netem's
+    delay-jitter does the opposite — symmetric per-packet delay + a
+    re-sorted queue — which reorders, lets packets beat the link floor,
+    and wrecks WebRTC's GCC; none of that happens on a real link.
   - bursty loss option uses Gilbert-Elliott (real loss isn't independent)
   - HTB burst is sized for the link (not artificially generous at low rates)
   - netem queue is sized from the bandwidth-delay product, so congestion
@@ -41,13 +44,13 @@ DISTRIBUTIONS = ("normal", "paretonormal", "pareto", "uniform")
 # bursty=True uses Gilbert-Elliott (more realistic for cellular/WiFi).
 PRESETS = {
     "Custom":            None,
-    "Off (full speed)":  dict(bw=BANDWIDTH_MAX, delay=0,   jitter=0,  distribution="normal",        correlation=25, loss=0, bursty=False, reorder=0),
-    "Slow 3G":           dict(bw=0.4,           delay=400, jitter=80, distribution="paretonormal",  correlation=50, loss=2, bursty=True,  reorder=0),
-    "Fast 3G":           dict(bw=1.6,           delay=150, jitter=40, distribution="paretonormal",  correlation=50, loss=1, bursty=True,  reorder=0),
-    "Patchy 4G":         dict(bw=5,             delay=80,  jitter=30, distribution="paretonormal",  correlation=50, loss=2, bursty=True,  reorder=0),
-    "Bad WiFi":          dict(bw=10,            delay=30,  jitter=40, distribution="paretonormal",  correlation=30, loss=3, bursty=True,  reorder=0),
-    "Slow DSL":          dict(bw=2,             delay=40,  jitter=8,  distribution="normal",        correlation=60, loss=0, bursty=False, reorder=0),
-    "Cable":             dict(bw=20,            delay=20,  jitter=4,  distribution="normal",        correlation=70, loss=0, bursty=False, reorder=0),
+    "Off (full speed)":  dict(bw=BANDWIDTH_MAX, delay=0,   jitter=0,  distribution="normal",        loss=0, bursty=False, reorder=0),
+    "Slow 3G":           dict(bw=0.4,           delay=400, jitter=80, distribution="paretonormal",  loss=2, bursty=True,  reorder=0),
+    "Fast 3G":           dict(bw=1.6,           delay=150, jitter=40, distribution="paretonormal",  loss=1, bursty=True,  reorder=0),
+    "Patchy 4G":         dict(bw=5,             delay=80,  jitter=30, distribution="paretonormal",  loss=2, bursty=True,  reorder=0),
+    "Bad WiFi":          dict(bw=10,            delay=30,  jitter=40, distribution="paretonormal",  loss=3, bursty=True,  reorder=0),
+    "Slow DSL":          dict(bw=2,             delay=40,  jitter=8,  distribution="normal",        loss=0, bursty=False, reorder=0),
+    "Cable":             dict(bw=20,            delay=20,  jitter=4,  distribution="normal",        loss=0, bursty=False, reorder=0),
 }
 
 
@@ -149,7 +152,7 @@ class UploadSimulator:
 
         info = ("Shapes EGRESS on the chosen interface (set a Target IP to spare your own\n"
                 "session). One-way: run it on the sender to preview what the receiver gets.\n"
-                "Defaults are realistic — uncorrelated uniform jitter wrecks WebRTC's GCC.")
+                "Defaults are realistic — jitter is one-sided and never reorders packets.")
         ttk.Label(self.root, text=info, font=("", 9), foreground="gray",
                   justify="center", wraplength=680).pack(pady=2)
 
@@ -205,9 +208,6 @@ class UploadSimulator:
         dist_combo.bind("<<ComboboxSelected>>", lambda e: self._on_slider_change())
         ttk.Label(params, text="(paretonormal ≈ real net)", font=("", 8), foreground="gray").grid(
             row=3, column=2, sticky="w", padx=5)
-
-        self._make_slider(params, 4, "Jitter correlation:", 0, 99, 25, "correlation_var", "correlation_label",
-                          formatter=lambda v: f"{int(v)} %")
 
         self._make_slider(params, 5, "Packet loss:", 0, 50, 0, "loss_var", "loss_label",
                           resolution=0.1, formatter=lambda v: f"{v:.1f} %")
@@ -284,7 +284,6 @@ class UploadSimulator:
         self.bw_label.config(text=self.bw_label_fmt(self.bw_var.get()))
         self.delay_label.config(text=self.delay_label_fmt(self.delay_var.get()))
         self.jitter_label.config(text=self.jitter_label_fmt(self.jitter_var.get()))
-        self.correlation_label.config(text=self.correlation_label_fmt(self.correlation_var.get()))
         self.loss_label.config(text=self.loss_label_fmt(self.loss_var.get()))
         self.corrupt_label.config(text=self.corrupt_label_fmt(self.corrupt_var.get()))
         self.reorder_label.config(text=self.reorder_label_fmt(self.reorder_var.get()))
@@ -308,7 +307,6 @@ class UploadSimulator:
             self.delay_var.set(cfg["delay"])
             self.jitter_var.set(cfg["jitter"])
             self.distribution_var.set(cfg["distribution"])
-            self.correlation_var.set(cfg["correlation"])
             self.loss_var.set(cfg["loss"])
             self.bursty_var.set(cfg["bursty"])
             self.corrupt_var.set(cfg.get("corrupt", 0))
@@ -415,7 +413,7 @@ class UploadSimulator:
     # ---------- TC application ----------
 
     def _has_non_default_settings(self):
-        # Distribution / correlation / bursty alone don't trigger; they only
+        # Distribution / bursty alone don't trigger; they only
         # shape behaviour when combined with non-zero delay / loss.
         return (
             int(self.delay_var.get()) > 0
@@ -433,31 +431,37 @@ class UploadSimulator:
         rate_bytes_per_sec = rate_mbit * 1_000_000 / 8
         return max(self.iface_mtu, int(rate_bytes_per_sec / 250))
 
-    def _build_netem_args(self, rate_mbit, delay, jitter, distribution, correlation,
+    def _build_netem_args(self, rate_mbit, delay, jitter, distribution,
                           loss, bursty, corrupt, reorder):
         """Build netem argument list for the given conditions.
 
-        Reorder needs a non-zero delay base to take effect.
-        Jitter is meaningless without a base delay >= jitter (otherwise
-        netem clamps the negative-delay tail to zero, skewing the
-        distribution). Auto-promote the base delay when needed.
+        Jitter is one-sided, in-order delay variation via netem's slot
+        scheduler: packets are released from the queue head after a
+        non-negative wait, so they only ever arrive later (never early) and
+        never overtake each other. netem's delay-jitter does the opposite —
+        it samples a symmetric delay per packet and re-sorts the queue, which
+        reorders and lets packets beat the link floor; neither happens on a
+        real LTE/5G/WiFi link. The base delay is a fixed propagation floor.
+
+        Reorder (the explicit knob) still needs a non-zero delay to act on.
         """
-        effective_delay = delay
-        if effective_delay < jitter:
-            effective_delay = jitter        # keep delay range non-negative
-        if effective_delay == 0 and reorder > 0:
-            effective_delay = 10            # reorder requires a delay clause
+        base_delay = delay
+        if base_delay == 0 and reorder > 0:
+            base_delay = 10                 # reorder requires a delay clause
 
-        args = [f"limit {self._build_limit(rate_mbit, effective_delay + jitter)}"]
+        args = [f"limit {self._build_limit(rate_mbit, base_delay + 3 * jitter)}"]
 
-        if effective_delay > 0:
-            if jitter > 0:
-                args.append(f"delay {effective_delay}ms {jitter}ms {int(correlation)}%")
-                # distribution applies to the delay clause; only meaningful with jitter
-                if distribution and distribution != "uniform":
-                    args.append(f"distribution {distribution}")
+        if base_delay > 0:
+            args.append(f"delay {base_delay}ms")
+
+        if jitter > 0:
+            # slot drains the FIFO in order after a wait of 0..jitter, so the
+            # variation is one-sided and order-preserving. The distribution
+            # shapes that wait (paretonormal ≈ real net); uniform has no table.
+            if distribution and distribution != "uniform":
+                args.append(f"slot distribution {distribution} 0ms {jitter}ms")
             else:
-                args.append(f"delay {effective_delay}ms")
+                args.append(f"slot 0ms {jitter}ms")
 
         if loss > 0:
             if bursty:
@@ -512,13 +516,12 @@ class UploadSimulator:
         delay = int(self.delay_var.get())
         jitter = int(self.jitter_var.get())
         distribution = self.distribution_var.get()
-        correlation = self.correlation_var.get()
         loss = self.loss_var.get()
         bursty = self.bursty_var.get()
         corrupt = self.corrupt_var.get()
         reorder = self.reorder_var.get()
         burst = self._build_burst(bw)
-        netem_args = self._build_netem_args(bw, delay, jitter, distribution, correlation,
+        netem_args = self._build_netem_args(bw, delay, jitter, distribution,
                                             loss, bursty, corrupt, reorder)
         iface = self.interface
 
@@ -572,7 +575,7 @@ class UploadSimulator:
         loss_str = f"{loss:.1f}% {'bursty' if bursty else 'random'}" if loss > 0 else "0%"
         self._set_status(
             f"Active ({scope})  |  {self._fmt_bandwidth(self.bw_var.get())}, "
-            f"latency {delay}±{jitter}ms ({distribution}, corr {int(correlation)}%), "
+            f"latency {delay}+{jitter}ms ({distribution} jitter, in-order), "
             f"loss {loss_str}, corrupt {corrupt:.1f}%, reorder {reorder:.1f}%",
             "green",
         )
